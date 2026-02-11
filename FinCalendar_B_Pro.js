@@ -5,7 +5,7 @@
 // 3) Upgrade de esquema no destructivo
 // 4) Ajustes explícitos de fondos con bitácora
 // 5) Resumen mensual y búsqueda rápida
-// 6) Horarios de sync configurables por settings
+// 6) Horarios configurables por tipo + duración de eventos
 
 const APP_FOLDER = "FinCalendar";
 const DATA_FILE = "data.json";
@@ -52,7 +52,9 @@ function defaultData() {
       calendarTimes: {
         obligationHour: 8,
         transactionHour: 9,
-        allocationHour: 10
+        allocationHour: 10,
+        paymentHour: 11,
+        durationMinutes: 30
       }
     },
     funds: [
@@ -80,6 +82,10 @@ function mergeDefaults(data) {
     ? d.settings.calendarTimes.transactionHour : base.settings.calendarTimes.transactionHour;
   d.settings.calendarTimes.allocationHour = Number.isInteger(d.settings.calendarTimes.allocationHour)
     ? d.settings.calendarTimes.allocationHour : base.settings.calendarTimes.allocationHour;
+  d.settings.calendarTimes.paymentHour = Number.isInteger(d.settings.calendarTimes.paymentHour)
+    ? d.settings.calendarTimes.paymentHour : base.settings.calendarTimes.paymentHour;
+  d.settings.calendarTimes.durationMinutes = Number.isInteger(d.settings.calendarTimes.durationMinutes)
+    ? d.settings.calendarTimes.durationMinutes : base.settings.calendarTimes.durationMinutes;
 
   d.funds = Array.isArray(d.funds) ? d.funds : base.funds;
   d.obligations = Array.isArray(d.obligations) ? d.obligations : [];
@@ -275,6 +281,9 @@ async function addTransaction(data, kind, monthDate) {
     return;
   }
 
+  const h = await askHour("Hora del evento para sync", (data.settings.calendarTimes || {}).transactionHour || 9);
+  if (h === null) return;
+
   data.transactions.push({
     id: uid("tx"),
     date: iso(d),
@@ -282,7 +291,8 @@ async function addTransaction(data, kind, monthDate) {
     name,
     amount,
     category: (kind === "expense" ? "Importante" : "Ingreso"),
-    note: ""
+    note: "",
+    eventHour: h
   });
 
   saveData(data);
@@ -320,13 +330,17 @@ async function addObligation(data, monthDate) {
     return;
   }
 
+  const h = await askHour("Hora de recordatorio de obligación", (data.settings.calendarTimes || {}).obligationHour || 8);
+  if (h === null) return;
+
   data.obligations.push({
     id: uid("obl"),
     name,
     dueDate: iso(d),
     amount,
     status: "pendiente", // pendiente | cubierta | pagada
-    note: ""
+    note: "",
+    eventHour: h
   });
 
   saveData(data);
@@ -364,13 +378,17 @@ async function allocateMoney(data, monthDate) {
     if (!fund) return;
 
     fund.balance += amount;
+    const h = await askHour("Hora del apartado para sync", (data.settings.calendarTimes || {}).allocationHour || 10);
+    if (h === null) return;
+
     data.allocations.push({
       id: uid("al"),
       date: iso(d),
       amount,
       direction: "toFund",
       toFundId: fund.id,
-      note: ""
+      note: "",
+      eventHour: h
     });
 
     saveData(data);
@@ -394,13 +412,17 @@ async function allocateMoney(data, monthDate) {
   );
   if (!obl) return;
 
+  const h = await askHour("Hora de la asignación para sync", (data.settings.calendarTimes || {}).allocationHour || 10);
+  if (h === null) return;
+
   data.allocations.push({
     id: uid("al"),
     date: iso(d),
     amount,
     direction: "toObligation",
     toObligationId: obl.id,
-    note: ""
+    note: "",
+    eventHour: h
   });
 
   const cov = computeObligationCoverage(data, obl.id);
@@ -447,6 +469,9 @@ async function registerPayment(data, monthDate) {
     fund.balance -= paidAmount;
   }
 
+  const h = await askHour("Hora del pago para sync", (data.settings.calendarTimes || {}).paymentHour || 11);
+  if (h === null) return;
+
   data.transactions.push({
     id: uid("tx"),
     date: todayISO(),
@@ -454,7 +479,8 @@ async function registerPayment(data, monthDate) {
     name: `Pago: ${obl.name}`,
     amount: paidAmount,
     category: "Pago",
-    note: ""
+    note: "PAYMENT_EVENT",
+    eventHour: h
   });
 
   if (paidAmount >= obl.amount) obl.status = "pagada";
@@ -587,6 +613,194 @@ async function quickSearch(data) {
   obls.slice(0, 15).forEach(o => lines.push(`• ${o.dueDate} ${o.name} ${fmtMoney(-o.amount)} (${o.status})`));
 
   await showMsg("Búsqueda", lines.join("\n") || "(sin coincidencias)");
+}
+
+
+async function askHour(title, defaultHour = 9) {
+  const h = await askNumber(title, "0-23", String(defaultHour));
+  if (h === null) return null;
+  if (!Number.isInteger(h) || h < 0 || h > 23) {
+    await showMsg("Hora inválida", "La hora debe ser un entero entre 0 y 23.");
+    return null;
+  }
+  return h;
+}
+
+function expenseSummaryByCategory(data, monthDate) {
+  const mk = monthKey(monthDate);
+  const byCat = {};
+  for (const t of data.transactions) {
+    if (!t.date.startsWith(mk) || t.type !== "expense") continue;
+    const k = t.category || "Sin categoría";
+    byCat[k] = (byCat[k] || 0) + Number(t.amount || 0);
+  }
+  return Object.entries(byCat).sort((a,b)=>b[1]-a[1]);
+}
+
+async function showExpenseSummary(data, monthDate) {
+  const mk = monthKey(monthDate);
+  const rows = expenseSummaryByCategory(data, monthDate);
+  const total = rows.reduce((acc, r) => acc + r[1], 0);
+  const lines = [
+    `Resumen de gastos ${mk}`,
+    `Total gastos: ${fmtMoney(-total)}`,
+    ""
+  ];
+  if (!rows.length) lines.push("(sin gastos este mes)");
+  for (const [cat, amount] of rows) {
+    const pct = total > 0 ? (amount * 100 / total) : 0;
+    lines.push(`• ${cat}: ${fmtMoney(-amount)} (${pct.toFixed(1)}%)`);
+  }
+  await showMsg("Gastos por categoría", lines.join("\n"));
+}
+
+async function configureCalendarSettings(data) {
+  const times = data.settings.calendarTimes || {};
+  const choice = await pickFromList("Configurar horarios de sync", [
+    "Hora transacciones",
+    "Hora apartados",
+    "Hora obligaciones",
+    "Hora pagos",
+    "Duración eventos (min)"
+  ], x => x);
+  if (!choice) return;
+
+  if (choice === "Hora transacciones") {
+    const h = await askHour("Hora para eventos de transacciones", times.transactionHour || 9);
+    if (h === null) return;
+    times.transactionHour = h;
+  }
+  if (choice === "Hora apartados") {
+    const h = await askHour("Hora para eventos de apartados", times.allocationHour || 10);
+    if (h === null) return;
+    times.allocationHour = h;
+  }
+  if (choice === "Hora obligaciones") {
+    const h = await askHour("Hora para eventos de obligaciones", times.obligationHour || 8);
+    if (h === null) return;
+    times.obligationHour = h;
+  }
+  if (choice === "Hora pagos") {
+    const h = await askHour("Hora para eventos de pagos", times.paymentHour || 11);
+    if (h === null) return;
+    times.paymentHour = h;
+  }
+  if (choice === "Duración eventos (min)") {
+    const d = await askNumber("Duración de cada evento", "Recomendado: 30", String(times.durationMinutes || 30));
+    if (d === null) return;
+    if (!Number.isInteger(d) || d < 5 || d > 240) {
+      await showMsg("Duración inválida", "Usa un entero entre 5 y 240 minutos.");
+      return;
+    }
+    times.durationMinutes = d;
+  }
+
+  data.settings.calendarTimes = times;
+  saveData(data);
+  await showMsg("Listo", "Configuración de calendario guardada.");
+}
+
+async function deleteRecords(data, monthDate) {
+  const choice = await pickFromList("Eliminar registros", [
+    "Eliminar transacción",
+    "Eliminar apartado/asignación",
+    "Eliminar obligación",
+    "Eliminar fondo (si está en cero)"
+  ], x => x);
+  if (!choice) return;
+
+  if (choice === "Eliminar transacción") {
+    const mk = monthKey(monthDate);
+    const items = data.transactions
+      .filter(t => t.date.startsWith(mk))
+      .sort((a,b)=>a.date.localeCompare(b.date));
+    const tx = await pickFromList("Elige transacción", items.length ? items : data.transactions,
+      t => `${t.date} — ${t.name} ${fmtMoney(t.type === "income" ? t.amount : -t.amount)}`);
+    if (!tx) return;
+    const ok = await confirm("Confirmar", `¿Eliminar transacción '${tx.name}'?`, "Eliminar");
+    if (!ok) return;
+    data.transactions = data.transactions.filter(t => t.id !== tx.id);
+    saveData(data);
+    await showMsg("Listo", "Transacción eliminada.");
+    return;
+  }
+
+  if (choice === "Eliminar apartado/asignación") {
+    const mk = monthKey(monthDate);
+    const items = data.allocations
+      .filter(a => a.date.startsWith(mk))
+      .sort((a,b)=>a.date.localeCompare(b.date));
+    const al = await pickFromList("Elige apartado", items.length ? items : data.allocations, a => {
+      let target = "";
+      if (a.direction === "toFund") {
+        const f = getFundById(data, a.toFundId);
+        target = `Fondo ${f ? f.name : "?"}`;
+      } else if (a.direction === "toObligation") {
+        const o = getOblById(data, a.toObligationId);
+        target = `Obligación ${o ? o.name : "?"}`;
+      } else target = a.direction;
+      return `${a.date} — ${target} ${fmtMoney(-a.amount)}`;
+    });
+    if (!al) return;
+    const ok = await confirm("Confirmar", "¿Eliminar este apartado?", "Eliminar");
+    if (!ok) return;
+
+    if (al.direction === "toFund") {
+      const fund = getFundById(data, al.toFundId);
+      if (fund) fund.balance = Math.max(0, fund.balance - al.amount);
+    }
+    data.allocations = data.allocations.filter(a => a.id !== al.id);
+    if (al.direction === "toObligation") {
+      const obl = getOblById(data, al.toObligationId);
+      if (obl && obl.status !== "pagada") {
+        const cov = computeObligationCoverage(data, obl.id);
+        obl.status = cov.remaining <= 0 ? "cubierta" : "pendiente";
+      }
+    }
+    saveData(data);
+    await showMsg("Listo", "Apartado eliminado.");
+    return;
+  }
+
+  if (choice === "Eliminar obligación") {
+    const mk = monthKey(monthDate);
+    const items = data.obligations
+      .filter(o => o.dueDate.startsWith(mk))
+      .sort((a,b)=>a.dueDate.localeCompare(b.dueDate));
+    const obl = await pickFromList("Elige obligación", items.length ? items : data.obligations,
+      o => `${o.dueDate} — ${o.name} ${fmtMoney(-o.amount)} (${o.status})`);
+    if (!obl) return;
+
+    const linked = data.allocations.filter(a => a.direction === "toObligation" && a.toObligationId === obl.id);
+    const warning = linked.length ? `Tiene ${linked.length} apartados ligados, también se eliminarán.` : "";
+    const ok = await confirm("Confirmar", `¿Eliminar obligación '${obl.name}'?\n${warning}`, "Eliminar");
+    if (!ok) return;
+
+    data.obligations = data.obligations.filter(o => o.id !== obl.id);
+    data.allocations = data.allocations.filter(a => !(a.direction === "toObligation" && a.toObligationId === obl.id));
+    saveData(data);
+    await showMsg("Listo", "Obligación eliminada.");
+    return;
+  }
+
+  if (choice === "Eliminar fondo (si está en cero)") {
+    const fund = await pickFromList("Elige fondo", data.funds, f => `${f.name} (${fmtMoney(f.balance)})`);
+    if (!fund) return;
+    if (Math.abs(fund.balance) > 0.0001) {
+      await showMsg("No permitido", "Solo puedes eliminar fondos con saldo 0.");
+      return;
+    }
+    const linked = data.allocations.some(a => a.direction === "toFund" && a.toFundId === fund.id);
+    if (linked) {
+      await showMsg("No permitido", "Ese fondo tiene apartados históricos. Manténlo o renómbralo.");
+      return;
+    }
+    const ok = await confirm("Confirmar", `¿Eliminar fondo '${fund.name}'?`, "Eliminar");
+    if (!ok) return;
+    data.funds = data.funds.filter(f => f.id !== fund.id);
+    saveData(data);
+    await showMsg("Listo", "Fondo eliminado.");
+  }
 }
 
 // -------------------- Vista Texto --------------------
@@ -825,12 +1039,12 @@ function monthRange(monthDate) {
   return { start, end };
 }
 
-function buildEventWindow(date, hour) {
+function buildEventWindow(date, hour, durationMinutes = 30) {
   const h = Math.max(0, Math.min(23, Number(hour || 9)));
-  return {
-    startDate: new Date(date.getFullYear(), date.getMonth(), date.getDate(), h, 0, 0),
-    endDate: new Date(date.getFullYear(), date.getMonth(), date.getDate(), h, 20, 0)
-  };
+  const d = Math.max(5, Math.min(240, Number(durationMinutes || 30)));
+  const startDate = new Date(date.getFullYear(), date.getMonth(), date.getDate(), h, 0, 0);
+  const endDate = new Date(startDate.getTime() + d * 60 * 1000);
+  return { startDate, endDate };
 }
 
 async function syncMonthToNativeCalendar(data, monthDate) {
@@ -854,7 +1068,7 @@ async function syncMonthToNativeCalendar(data, monthDate) {
     const date = isoToDate(t.date);
     const ev = new CalendarEvent();
     ev.calendar = cal;
-    const win = buildEventWindow(date, times.transactionHour);
+    const win = buildEventWindow(date, Number.isInteger(t.eventHour) ? t.eventHour : times.transactionHour, duration);
     ev.startDate = win.startDate;
     ev.endDate = win.endDate;
 
@@ -871,7 +1085,7 @@ async function syncMonthToNativeCalendar(data, monthDate) {
     const date = isoToDate(a.date);
     const ev = new CalendarEvent();
     ev.calendar = cal;
-    const win = buildEventWindow(date, times.allocationHour);
+    const win = buildEventWindow(date, Number.isInteger(a.eventHour) ? a.eventHour : times.allocationHour, duration);
     ev.startDate = win.startDate;
     ev.endDate = win.endDate;
 
@@ -897,7 +1111,7 @@ async function syncMonthToNativeCalendar(data, monthDate) {
     const date = isoToDate(o.dueDate);
     const ev = new CalendarEvent();
     ev.calendar = cal;
-    const win = buildEventWindow(date, times.obligationHour);
+    const win = buildEventWindow(date, Number.isInteger(o.eventHour) ? o.eventHour : times.obligationHour, duration);
     ev.startDate = win.startDate;
     ev.endDate = win.endDate;
 
@@ -927,6 +1141,7 @@ async function main() {
     menu.addAction("📅 Ver calendario del mes (texto)");
     menu.addAction("🗓️ Ver calendario del mes (GUI)");
     menu.addAction("📊 Resumen del mes");
+    menu.addAction("💸 Resumen de gastos");
     menu.addAction("🔎 Búsqueda rápida");
     menu.addAction("➕ Agregar ingreso");
     menu.addAction("➖ Agregar gasto");
@@ -935,6 +1150,8 @@ async function main() {
     menu.addAction("🧷 Apartar / Asignar dinero");
     menu.addAction("✅ Registrar pago de obligación");
     menu.addAction("📲 Sync mes al Calendario iPhone");
+    menu.addAction("🛠️ Configurar horas/duración sync");
+    menu.addAction("🗑️ Eliminar movimientos/obligaciones");
     menu.addAction("◀️ Mes anterior");
     menu.addAction("▶️ Mes siguiente");
     menu.addCancelAction("Salir");
@@ -945,16 +1162,19 @@ async function main() {
     if (r === 0) await viewMonthText(safeLoadData(), currentMonth);
     if (r === 1) await viewCalendarGUI(safeLoadData(), currentMonth);
     if (r === 2) await showMonthSummary(safeLoadData(), currentMonth);
-    if (r === 3) await quickSearch(safeLoadData());
-    if (r === 4) { const d = safeLoadData(); await addTransaction(d, "income", currentMonth); }
-    if (r === 5) { const d = safeLoadData(); await addTransaction(d, "expense", currentMonth); }
-    if (r === 6) { const d = safeLoadData(); await manageObligations(d, currentMonth); }
-    if (r === 7) { const d = safeLoadData(); await manageFunds(d); }
-    if (r === 8) { const d = safeLoadData(); await allocateMoney(d, currentMonth); }
-    if (r === 9) { const d = safeLoadData(); await registerPayment(d, currentMonth); }
-    if (r === 10) { const d = safeLoadData(); await syncMonthToNativeCalendar(d, currentMonth); }
-    if (r === 11) currentMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() - 1, 1);
-    if (r === 12) currentMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 1);
+    if (r === 3) await showExpenseSummary(safeLoadData(), currentMonth);
+    if (r === 4) await quickSearch(safeLoadData());
+    if (r === 5) { const d = safeLoadData(); await addTransaction(d, "income", currentMonth); }
+    if (r === 6) { const d = safeLoadData(); await addTransaction(d, "expense", currentMonth); }
+    if (r === 7) { const d = safeLoadData(); await manageObligations(d, currentMonth); }
+    if (r === 8) { const d = safeLoadData(); await manageFunds(d); }
+    if (r === 9) { const d = safeLoadData(); await allocateMoney(d, currentMonth); }
+    if (r === 10) { const d = safeLoadData(); await registerPayment(d, currentMonth); }
+    if (r === 11) { const d = safeLoadData(); await syncMonthToNativeCalendar(d, currentMonth); }
+    if (r === 12) { const d = safeLoadData(); await configureCalendarSettings(d); }
+    if (r === 13) { const d = safeLoadData(); await deleteRecords(d, currentMonth); }
+    if (r === 14) currentMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() - 1, 1);
+    if (r === 15) currentMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 1);
   }
 }
 
