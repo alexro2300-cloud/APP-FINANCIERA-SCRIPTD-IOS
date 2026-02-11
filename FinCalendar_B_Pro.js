@@ -124,7 +124,29 @@ function safeLoadData() {
 function saveData(data) { fm.writeString(dataPath, JSON.stringify(mergeDefaults(data), null, 2)); }
 function uid(prefix) { return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now()}`; }
 
+function canShowAlerts() {
+  try {
+    if (typeof config !== "undefined" && config && config.runsWithSiri) return false;
+    if (typeof config !== "undefined" && config && config.runsInApp === false) return false;
+  } catch (_) {}
+  return true;
+}
+
+async function emitShortcutOutput(obj) {
+  try {
+    if (typeof Script !== "undefined" && Script.setShortcutOutput) Script.setShortcutOutput(obj);
+  } catch (_) {}
+}
+
 async function showMsg(title, message) {
+  if (!canShowAlerts()) {
+    const n = new Notification();
+    n.title = String(title || "FinCalendar");
+    n.body = String(message || "");
+    try { await n.schedule(); } catch (_) {}
+    await emitShortcutOutput({ ok: true, title, message });
+    return;
+  }
   const a = new Alert();
   a.title = title;
   a.message = message;
@@ -133,6 +155,7 @@ async function showMsg(title, message) {
 }
 
 async function confirm(title, message, okText = "Aceptar", cancelText = "Cancelar") {
+  if (!canShowAlerts()) return false;
   const a = new Alert();
   a.title = title;
   a.message = message;
@@ -1130,12 +1153,31 @@ async function syncMonthToNativeCalendar(data, monthDate) {
 
 
 function normalizeShortcutInput() {
-  if (args && args.shortcutParameter !== undefined && args.shortcutParameter !== null) {
-    return args.shortcutParameter;
+  if (!args) return null;
+
+  if (args.shortcutParameter !== undefined && args.shortcutParameter !== null) {
+    const p = args.shortcutParameter;
+    if (typeof p === "string") return p;
+    if (typeof p === "object") {
+      if (Array.isArray(p.Texts) && p.Texts.length) return p.Texts[0];
+      if (Array.isArray(p.texts) && p.texts.length) return p.texts[0];
+      if (Array.isArray(p.URLs) && p.URLs.length) return p.URLs[0];
+      if (Array.isArray(p.urls) && p.urls.length) return p.urls[0];
+      return p;
+    }
+    return p;
   }
-  if (args && Array.isArray(args.plainTexts) && args.plainTexts.length) {
-    return args.plainTexts[0];
-  }
+
+  if (Array.isArray(args.plainTexts) && args.plainTexts.length) return args.plainTexts[0];
+  if (Array.isArray(args.urls) && args.urls.length) return String(args.urls[0]);
+
+  try {
+    if (typeof Pasteboard !== "undefined" && Pasteboard.pasteString) {
+      const clip = Pasteboard.pasteString();
+      if (clip && typeof clip === "string" && clip.trim()) return clip.trim();
+    }
+  } catch (_) {}
+
   return null;
 }
 
@@ -1196,14 +1238,17 @@ async function runShortcutCommand() {
 
   if (action === "sync") {
     await syncMonthToNativeCalendar(data, monthDate);
+    await emitShortcutOutput({ ok: true, action: "sync" });
     return true;
   }
   if (action === "summary") {
     await showMonthSummary(data, monthDate);
+    await emitShortcutOutput({ ok: true, action: "summary" });
     return true;
   }
   if (action === "expense-summary" || action === "gastos") {
     await showExpenseSummary(data, monthDate);
+    await emitShortcutOutput({ ok: true, action: "expense-summary" });
     return true;
   }
   if (action === "add-expense" || action === "expense") {
@@ -1225,6 +1270,11 @@ async function main() {
 
   const shortcutHandled = await runShortcutCommand();
   if (shortcutHandled) return;
+
+  if (!canShowAlerts()) {
+    await emitShortcutOutput({ ok: false, error: "No command received for non-interactive run.", hint: "Pass text like 'sync' or JSON payload as shortcut parameter." });
+    return;
+  }
 
   let currentMonth = new Date();
 
