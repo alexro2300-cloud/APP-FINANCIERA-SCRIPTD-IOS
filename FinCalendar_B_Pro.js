@@ -1054,6 +1054,7 @@ async function syncMonthToNativeCalendar(data, monthDate) {
   const mk = monthKey(monthDate);
   const { start, end } = monthRange(monthDate);
   const times = data.settings.calendarTimes || {};
+  const duration = times.durationMinutes || 30;
 
   const existing = await CalendarEvent.between(start, end, [cal]);
   for (const ev of existing) {
@@ -1127,10 +1128,104 @@ async function syncMonthToNativeCalendar(data, monthDate) {
   await showMsg("Sync listo", `Sincronizado ${mk} al calendario: "${cal.title}".`);
 }
 
+
+function normalizeShortcutInput() {
+  if (args && args.shortcutParameter !== undefined && args.shortcutParameter !== null) {
+    return args.shortcutParameter;
+  }
+  if (args && Array.isArray(args.plainTexts) && args.plainTexts.length) {
+    return args.plainTexts[0];
+  }
+  return null;
+}
+
+function parseShortcutCommand(raw) {
+  if (!raw) return null;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    if (trimmed.startsWith("{")) {
+      try { return JSON.parse(trimmed); } catch (_) { return { action: trimmed.toLowerCase() }; }
+    }
+    return { action: trimmed.toLowerCase() };
+  }
+  if (typeof raw === "object") return raw;
+  return null;
+}
+
+function parseISODateOrToday(v) {
+  if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+  return todayISO();
+}
+
+async function quickAddTransaction(data, cmd, kind) {
+  const name = clampText(cmd.name || cmd.concept || "Movimiento rápido", "Movimiento rápido");
+  const amount = toPositiveNumber(cmd.amount);
+  if (!amount) {
+    await showMsg("Atajo inválido", "Falta un monto válido en el atajo.");
+    return;
+  }
+
+  const dateISO = parseISODateOrToday(cmd.date);
+  const defaultHour = (data.settings.calendarTimes || {}).transactionHour || 9;
+  const eventHour = Number.isInteger(cmd.hour) ? cmd.hour : defaultHour;
+
+  data.transactions.push({
+    id: uid("tx"),
+    date: dateISO,
+    type: kind,
+    name,
+    amount,
+    category: clampText(cmd.category || (kind === "expense" ? "Importante" : "Ingreso"), "General"),
+    note: clampText(cmd.note || ""),
+    eventHour
+  });
+
+  saveData(data);
+  await showMsg("Atajo listo", `${kind === "income" ? "Ingreso" : "Gasto"} registrado: ${name} ${fmtMoney(kind === "income" ? amount : -amount)}`);
+}
+
+async function runShortcutCommand() {
+  const raw = normalizeShortcutInput();
+  const cmd = parseShortcutCommand(raw);
+  if (!cmd || !cmd.action) return false;
+
+  const action = String(cmd.action).toLowerCase();
+  const data = safeLoadData();
+  const monthDate = new Date();
+
+  if (action === "sync") {
+    await syncMonthToNativeCalendar(data, monthDate);
+    return true;
+  }
+  if (action === "summary") {
+    await showMonthSummary(data, monthDate);
+    return true;
+  }
+  if (action === "expense-summary" || action === "gastos") {
+    await showExpenseSummary(data, monthDate);
+    return true;
+  }
+  if (action === "add-expense" || action === "expense") {
+    await quickAddTransaction(data, cmd, "expense");
+    return true;
+  }
+  if (action === "add-income" || action === "income") {
+    await quickAddTransaction(data, cmd, "income");
+    return true;
+  }
+
+  return false;
+}
+
 // -------------------- MAIN --------------------
 
 async function main() {
   await ensureStorage();
+
+  const shortcutHandled = await runShortcutCommand();
+  if (shortcutHandled) return;
+
   let currentMonth = new Date();
 
   while (true) {
